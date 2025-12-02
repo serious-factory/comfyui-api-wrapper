@@ -9,7 +9,7 @@ A FastAPI wrapper for ComfyUI that provides a scalable, production-ready interfa
 - **Asynchronous request handling** with webhook notifications
 - **Synchronous requests** that wait for completion  
 - **Real-time streaming** of generation progress with queue positions
-- **Automatic asset management** and S3 upload
+- **Automatic asset management** and cloud uploads (S3 or Azure Blob)
 - **Queue position tracking** and estimated wait times
 - **Workflow modification system** for dynamic workflow processing
 - **Redis or in-memory caching** support
@@ -76,6 +76,11 @@ A FastAPI wrapper for ComfyUI that provides a scalable, production-ready interfa
     },
     "workflow_json": {
       // Alternative to modifier: direct ComfyUI workflow
+    },
+    "azure": {
+      "connection_string": "your-connection-string",
+      "container": "your-container",
+      "endpoint_url": "https://<account>.blob.core.windows.net"
     },
     "s3": {
       "access_key_id": "your-access-key",
@@ -179,6 +184,9 @@ Configure the service using environment variables:
 ### ComfyUI Connection
 ```bash
 COMFYUI_API_BASE=http://127.0.0.1:8188  # ComfyUI API endpoint
+COMFY_WS_INITIAL_TIMEOUT=30             # Seconds to wait for first WS message from ComfyUI
+COMFY_WS_MESSAGE_TIMEOUT=60             # Seconds between WS messages before timing out
+COMFY_WS_MAX_WAIT_TIME=3600             # Overall WS wait cap
 ```
 
 ### Worker Configuration
@@ -204,6 +212,16 @@ S3_SECRET_ACCESS_KEY=your-secret
 S3_BUCKET_NAME=your-bucket
 S3_ENDPOINT_URL=https://s3.amazonaws.com
 S3_REGION=us-east-1
+```
+
+### Azure Blob Storage Configuration (Optional)
+```bash
+AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=...;AccountName=...;AccountKey=..."
+# or use account/key instead of connection string:
+AZURE_STORAGE_ACCOUNT_NAME=your-account
+AZURE_STORAGE_ACCOUNT_KEY=your-key
+AZURE_STORAGE_ENDPOINT_URL=https://your-account.blob.core.windows.net  # optional override
+AZURE_STORAGE_CONTAINER=your-container
 ```
 
 ### Webhook Configuration (Optional)
@@ -384,5 +402,4 @@ The API uses standard HTTP status codes:
 2. **Install dependencies**: `pip install -r requirements.txt`
 3. **Start ComfyUI**: Ensure ComfyUI is running on port 8188
 4. **Run development server**: `uvicorn main:app --reload`
-
 

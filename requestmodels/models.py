@@ -47,6 +47,40 @@ class S3Config(BaseModel):
             config["bucket_name"]
         )
 
+class AzureConfig(BaseModel):
+    connection_string: str = Field(default="")
+    account_name: str = Field(default="")
+    account_key: str = Field(default="")
+    container: str = Field(default="")
+    endpoint_url: str = Field(default="")
+
+    @staticmethod
+    def get_defaults():
+        return {
+            "connection_string": "",
+            "account_name": "",
+            "account_key": "",
+            "container": "",
+            "endpoint_url": ""
+        }
+
+    def get_config(self) -> Dict:
+        """Get Azure Blob configuration with environment variable fallbacks"""
+        return {
+            "connection_string": self.connection_string or os.environ.get("AZURE_STORAGE_CONNECTION_STRING", ""),
+            "account_name": self.account_name or os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", ""),
+            "account_key": self.account_key or os.environ.get("AZURE_STORAGE_ACCOUNT_KEY", ""),
+            "container": self.container or os.environ.get("AZURE_STORAGE_CONTAINER", ""),
+            "endpoint_url": self.endpoint_url or os.environ.get("AZURE_STORAGE_ENDPOINT_URL", "")
+        }
+
+    def is_configured(self) -> bool:
+        """Check if Azure Blob storage is properly configured"""
+        cfg = self.get_config()
+        has_conn = bool(cfg["connection_string"])
+        has_account = bool(cfg["account_name"] and cfg["account_key"])
+        return bool(cfg["container"] and (has_conn or has_account))
+
 
 class WebHook(BaseModel):
     url: str = Field(default="")
@@ -81,6 +115,7 @@ class Input(BaseModel):
     modifications: Dict = Field(default_factory=dict)
     workflow_json: Dict = Field(default_factory=dict)
     s3: Optional[S3Config] = Field(default=None)
+    azure: Optional[AzureConfig] = Field(default=None)
     webhook: Optional[WebHook] = Field(default=None)
     
     @model_validator(mode='after')

@@ -22,6 +22,12 @@ COMFYUI_API_INTERRUPT = urljoin(COMFYUI_API_BASE, '/api/interrupt')
 # WebSocket endpoint (convert http to ws, https to wss)
 COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
 
+# WebSocket timeouts (ComfyUI listener)
+WEBSOCKET_INITIAL_TIMEOUT = float(os.getenv("COMFY_WS_INITIAL_TIMEOUT", "30"))
+WEBSOCKET_MESSAGE_TIMEOUT = float(os.getenv("COMFY_WS_MESSAGE_TIMEOUT", "60"))
+WEBSOCKET_MAX_NO_MESSAGE_RETRIES = int(os.getenv("COMFY_WS_MAX_NO_MESSAGE_RETRIES", "3"))
+WEBSOCKET_MAX_WAIT_TIME = float(os.getenv("COMFY_WS_MAX_WAIT_TIME", "3600"))  # overall cap
+
 # Cache configuration
 CACHE_TYPE = "redis" if os.getenv("API_CACHE", "").lower() == "redis" else "memory"
 CACHE_TTL = int(os.getenv("API_CACHE_TTL", 21600))  # 6 hours as default
@@ -65,6 +71,22 @@ WORKER_CONFIG = {
     "postprocess_workers": int(os.getenv("POSTPROCESS_WORKERS", "2")),
     "max_queue_size": int(os.getenv("MAX_QUEUE_SIZE", "100"))
 }
+
+# Azure Blob Storage Configuration (fallback from environment)
+AZURE_CONFIG = {
+    "connection_string": os.getenv("AZURE_STORAGE_CONNECTION_STRING", ""),
+    "account_name": os.getenv("AZURE_STORAGE_ACCOUNT_NAME", ""),
+    "account_key": os.getenv("AZURE_STORAGE_ACCOUNT_KEY", ""),
+    "container": os.getenv("AZURE_STORAGE_CONTAINER", ""),
+    "endpoint_url": os.getenv("AZURE_STORAGE_ENDPOINT_URL", "")
+}
+
+AZURE_ENABLED = bool(
+    AZURE_CONFIG["container"] and (
+        AZURE_CONFIG["connection_string"] or
+        (AZURE_CONFIG["account_name"] and AZURE_CONFIG["account_key"])
+    )
+)
 
 # Redis Configuration (if using Redis cache)
 REDIS_CONFIG = {

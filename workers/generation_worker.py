@@ -6,7 +6,16 @@ import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET
+from config import (
+    COMFYUI_API_PROMPT,
+    COMFYUI_API_HISTORY,
+    COMFYUI_API_INTERRUPT,
+    COMFYUI_API_WEBSOCKET,
+    WEBSOCKET_INITIAL_TIMEOUT,
+    WEBSOCKET_MESSAGE_TIMEOUT,
+    WEBSOCKET_MAX_NO_MESSAGE_RETRIES,
+    WEBSOCKET_MAX_WAIT_TIME,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +33,7 @@ class GenerationWorker:
         self.response_store = kwargs["response_store"]
         
         # Configuration
-        self.max_wait_time = 3600  # 1 hour maximum wait
+        self.max_wait_time = WEBSOCKET_MAX_WAIT_TIME
         self.ws_url = COMFYUI_API_WEBSOCKET
         self.client_id = f"worker_{worker_id}_{datetime.now().timestamp()}"
 
@@ -236,9 +245,9 @@ class GenerationWorker:
                     last_cancellation_check = start_time
                     
                     # Progressive timeout strategy
-                    initial_timeout = 30.0  # 30 seconds to receive first message
-                    message_timeout = 60.0  # 60 seconds between messages after first message received
-                    max_no_message_retries = 3  # Number of times to retry when no messages received
+                    initial_timeout = WEBSOCKET_INITIAL_TIMEOUT  # seconds to receive first message
+                    message_timeout = WEBSOCKET_MESSAGE_TIMEOUT  # seconds between messages after first message received
+                    max_no_message_retries = WEBSOCKET_MAX_NO_MESSAGE_RETRIES  # retries when no messages received
                     no_message_retry_count = 0
                     
                     while True:

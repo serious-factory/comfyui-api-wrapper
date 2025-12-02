@@ -12,7 +12,7 @@ import aiofiles
 import aiofiles.os
 import aiohttp
 
-from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
+from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, AZURE_CONFIG, AZURE_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +62,24 @@ class PostprocessWorker:
                     # Move generated assets to organized directory
                     await self.move_assets(request_id, result)
                     
-                    # Handle S3 upload - check payload first, then environment variables
-                    s3_config = await self.get_s3_config(request.input)
-                    if s3_config:
-                        await self.upload_assets(request_id, s3_config, result)
+                    storage_uploaded = False
+
+                    # Handle Azure Blob upload if configured (payload first, then environment)
+                    azure_config = await self.get_azure_config(request.input)
+                    if azure_config:
+                        await self.upload_assets_azure(request_id, azure_config, result)
+                        storage_uploaded = True
                     else:
-                        logger.info(f"No S3 configuration found for {request_id}, skipping upload")
+                        logger.info(f"No Azure storage configuration found for {request_id}")
+
+                    # Handle S3 upload - check payload first, then environment variables
+                    if not storage_uploaded:
+                        s3_config = await self.get_s3_config(request.input)
+                        if s3_config:
+                            await self.upload_assets(request_id, s3_config, result)
+                            storage_uploaded = True
+                        else:
+                            logger.info(f"No S3 configuration found for {request_id}, skipping upload")
                 else:
                     logger.info(f"No ComfyUI output for {request_id}, likely a failed job")
                     if hasattr(result, 'comfyui_response'):
@@ -393,6 +405,81 @@ class PostprocessWorker:
             logger.error(f"Error uploading {local_path}: {e}")
             raise
 
+    async def upload_assets_azure(self, request_id: str, azure_config: Dict, result) -> None:
+        """Upload assets to Azure Blob Storage"""
+        if not hasattr(result, 'output') or not result.output:
+            logger.info(f"No assets to upload for {request_id}")
+            return
+
+        try:
+            from azure.storage.blob.aio import BlobServiceClient
+            from azure.core.exceptions import ResourceExistsError
+        except Exception as exc:
+            logger.error(f"Azure Blob SDK not available: {exc}")
+            raise
+
+        try:
+            container_name = azure_config.get("container")
+            if not container_name:
+                raise ValueError("Azure container is required")
+
+            connection_string = azure_config.get("connection_string")
+            account_name = azure_config.get("account_name")
+            account_key = azure_config.get("account_key")
+            endpoint_url = azure_config.get("endpoint_url") or (f"https://{account_name}.blob.core.windows.net" if account_name else "")
+
+            if connection_string:
+                client = BlobServiceClient.from_connection_string(connection_string)
+            elif account_name and account_key:
+                client = BlobServiceClient(account_url=endpoint_url, credential=account_key)
+            else:
+                raise ValueError("Azure config must include connection_string or account_name + account_key")
+
+            async with client:
+                container_client = client.get_container_client(container_name)
+                try:
+                    await container_client.create_container()
+                except ResourceExistsError:
+                    pass
+
+                tasks = []
+                for obj in result.output:
+                    local_path = obj.get("local_path")
+                    if local_path and Path(local_path).exists():
+                        blob_name = f"{request_id}/{Path(local_path).name}"
+                        tasks.append(asyncio.create_task(
+                            self.upload_blob_and_get_url(container_client, blob_name, local_path)
+                        ))
+                    else:
+                        logger.warning(f"Local file not found: {local_path}")
+                        tasks.append(asyncio.create_task(self._return_none()))
+
+                if tasks:
+                    urls = await asyncio.gather(*tasks, return_exceptions=True)
+                    for obj, url_result in zip(result.output, urls):
+                        if isinstance(url_result, Exception):
+                            logger.error(f"Azure upload failed for {obj.get('local_path')}: {url_result}")
+                            obj["upload_error"] = str(url_result)
+                        elif url_result:
+                            obj["url"] = url_result
+
+                    logger.info(f"Uploaded {len([u for u in urls if u and not isinstance(u, Exception)])} assets to Azure for {request_id}")
+
+        except Exception as e:
+            logger.error(f"Error uploading assets to Azure for {request_id}: {e}")
+            raise
+
+    async def upload_blob_and_get_url(self, container_client, blob_name: str, local_path: str) -> Optional[str]:
+        """Upload a file to Azure Blob and return its URL"""
+        try:
+            async with aiofiles.open(local_path, 'rb') as file:
+                data = await file.read()
+                await container_client.upload_blob(name=blob_name, data=data, overwrite=True)
+            return f"{container_client.url}/{blob_name}"
+        except Exception as e:
+            logger.error(f"Error uploading {local_path} to Azure: {e}")
+            raise
+
     async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None) -> None:
         """Send webhook notification with result"""
         try:
@@ -446,6 +533,24 @@ class PostprocessWorker:
             
         except Exception as e:
             logger.error(f"Error getting S3 config: {e}")
+            return None
+
+    async def get_azure_config(self, input_data) -> Optional[Dict]:
+        """Get Azure Blob configuration from payload or environment"""
+        try:
+            if hasattr(input_data, 'azure') and input_data.azure:
+                if input_data.azure.is_configured():
+                    logger.info("Using Azure storage config from payload")
+                    return input_data.azure.get_config()
+
+            if AZURE_ENABLED:
+                logger.info("Using Azure storage config from environment variables")
+                return AZURE_CONFIG.copy()
+
+            logger.debug("No Azure storage configuration available")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting Azure storage config: {e}")
             return None
 
     async def get_webhook_config(self, input_data) -> Optional[Dict]:

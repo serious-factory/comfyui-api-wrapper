@@ -9,3 +9,4 @@ python-magic
 uvicorn[standard]>=0.24.0
 markdown
 python-dotenv>=1.0.0
+azure-storage-blob
