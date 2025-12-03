@@ -10,3 +10,6 @@ uvicorn[standard]>=0.24.0
 markdown
 python-dotenv>=1.0.0
 azure-storage-blob
+azure-core
+azure-identity
+azure-common
