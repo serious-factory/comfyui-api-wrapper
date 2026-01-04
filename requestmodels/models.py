@@ -114,6 +114,7 @@ class Input(BaseModel):
     modifier: str = Field(default="")
     modifications: Dict = Field(default_factory=dict)
     workflow_json: Dict = Field(default_factory=dict)
+    output_prefix: str = Field(default="")
     s3: Optional[S3Config] = Field(default=None)
     azure: Optional[AzureConfig] = Field(default=None)
     webhook: Optional[WebHook] = Field(default=None)

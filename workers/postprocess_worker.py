@@ -66,8 +66,9 @@ class PostprocessWorker:
 
                     # Handle Azure Blob upload if configured (payload first, then environment)
                     azure_config = await self.get_azure_config(request.input)
+                    output_prefix = self.get_output_prefix(request.input)
                     if azure_config:
-                        await self.upload_assets_azure(request_id, azure_config, result)
+                        await self.upload_assets_azure(request_id, azure_config, result, output_prefix)
                         storage_uploaded = True
                     else:
                         logger.info(f"No Azure storage configuration found for {request_id}")
@@ -76,7 +77,7 @@ class PostprocessWorker:
                     if not storage_uploaded:
                         s3_config = await self.get_s3_config(request.input)
                         if s3_config:
-                            await self.upload_assets(request_id, s3_config, result)
+                            await self.upload_assets(request_id, s3_config, result, output_prefix)
                             storage_uploaded = True
                         else:
                             logger.info(f"No S3 configuration found for {request_id}, skipping upload")
@@ -304,7 +305,7 @@ class PostprocessWorker:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, os.symlink, str(target), str(link))
 
-    async def upload_assets(self, request_id: str, s3_config: Dict, result) -> None:
+    async def upload_assets(self, request_id: str, s3_config: Dict, result, output_prefix: str = "") -> None:
         """Upload assets to S3 storage"""
         if not hasattr(result, 'output') or not result.output:
             logger.info(f"No assets to upload for {request_id}")
@@ -332,6 +333,7 @@ class PostprocessWorker:
             )
             client_config['config'] = aio_config
             
+            key_prefix = self._normalize_prefix(output_prefix) or request_id
             async with session.create_client('s3', **client_config) as s3_client:
                 bucket_name = s3_config.get("bucket_name")
                 if not bucket_name:
@@ -344,7 +346,7 @@ class PostprocessWorker:
                     if local_path and Path(local_path).exists():
                         task = asyncio.create_task(
                             self.upload_file_and_get_url(
-                                request_id, s3_client, bucket_name, local_path
+                                request_id, s3_client, bucket_name, local_path, key_prefix
                             )
                         )
                         tasks.append(task)
@@ -374,11 +376,11 @@ class PostprocessWorker:
         """Helper for asyncio.gather with missing files"""
         return None
 
-    async def upload_file_and_get_url(self, request_id: str, s3_client, bucket_name: str, local_path: str) -> Optional[str]:
+    async def upload_file_and_get_url(self, request_id: str, s3_client, bucket_name: str, local_path: str, key_prefix: str) -> Optional[str]:
         """Upload single file and return presigned URL"""
         try:
             file_path = Path(local_path)
-            s3_key = f"{request_id}/{file_path.name}"
+            s3_key = f"{key_prefix}/{file_path.name}"
             
             logger.debug(f"Uploading {s3_key} to bucket {bucket_name}")
 
@@ -405,7 +407,7 @@ class PostprocessWorker:
             logger.error(f"Error uploading {local_path}: {e}")
             raise
 
-    async def upload_assets_azure(self, request_id: str, azure_config: Dict, result) -> None:
+    async def upload_assets_azure(self, request_id: str, azure_config: Dict, result, output_prefix: str = "") -> None:
         """Upload assets to Azure Blob Storage"""
         if not hasattr(result, 'output') or not result.output:
             logger.info(f"No assets to upload for {request_id}")
@@ -442,11 +444,12 @@ class PostprocessWorker:
                 except ResourceExistsError:
                     pass
 
+                blob_prefix = self._normalize_prefix(output_prefix) or request_id
                 tasks = []
                 for obj in result.output:
                     local_path = obj.get("local_path")
                     if local_path and Path(local_path).exists():
-                        blob_name = f"{request_id}/{Path(local_path).name}"
+                        blob_name = f"{blob_prefix}/{Path(local_path).name}"
                         tasks.append(asyncio.create_task(
                             self.upload_blob_and_get_url(container_client, blob_name, local_path)
                         ))
@@ -582,3 +585,15 @@ class PostprocessWorker:
         except Exception as e:
             logger.error(f"Error getting webhook config: {e}")
             return None
+
+    def get_output_prefix(self, input_data) -> str:
+        """Get output prefix from payload"""
+        try:
+            if hasattr(input_data, 'output_prefix') and input_data.output_prefix:
+                return str(input_data.output_prefix)
+        except Exception:
+            return ""
+        return ""
+
+    def _normalize_prefix(self, value: str) -> str:
+        return value.strip().strip("/")

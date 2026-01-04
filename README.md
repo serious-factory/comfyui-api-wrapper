@@ -77,6 +77,7 @@ A FastAPI wrapper for ComfyUI that provides a scalable, production-ready interfa
     "workflow_json": {
       // Alternative to modifier: direct ComfyUI workflow
     },
+    "output_prefix": "optional/output/prefix",
     "azure": {
       "connection_string": "your-connection-string",
       "container": "your-container",
@@ -402,4 +403,3 @@ The API uses standard HTTP status codes:
 2. **Install dependencies**: `pip install -r requirements.txt`
 3. **Start ComfyUI**: Ensure ComfyUI is running on port 8188
 4. **Run development server**: `uvicorn main:app --reload`
-
