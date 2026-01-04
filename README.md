@@ -78,6 +78,7 @@ A FastAPI wrapper for ComfyUI that provides a scalable, production-ready interfa
       // Alternative to modifier: direct ComfyUI workflow
     },
     "output_prefix": "optional/output/prefix",
+    "output_filename": "optional/output-filename.mp4",
     "azure": {
       "connection_string": "your-connection-string",
       "container": "your-container",
