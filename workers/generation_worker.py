@@ -9,6 +9,7 @@ from datetime import datetime
 from config import (
     COMFYUI_API_PROMPT,
     COMFYUI_API_HISTORY,
+    COMFYUI_API_QUEUE,
     COMFYUI_API_INTERRUPT,
     COMFYUI_API_WEBSOCKET,
     WEBSOCKET_INITIAL_TIMEOUT,
@@ -213,6 +214,27 @@ class GenerationWorker:
             logger.debug(f"Error checking cache status: {e}")
             return False
     
+    async def check_if_running(self, comfyui_job_id: str) -> bool:
+        """Check if job is still queued or running in ComfyUI via /queue endpoint"""
+        timeout = aiohttp.ClientTimeout(total=5)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(COMFYUI_API_QUEUE) as response:
+                    if response.status == 200:
+                        queue_data = await response.json()
+                        # Check running jobs
+                        for item in queue_data.get("queue_running", []):
+                            if len(item) >= 2 and isinstance(item[1], str) and item[1] == comfyui_job_id:
+                                return True
+                        # Check pending jobs
+                        for item in queue_data.get("queue_pending", []):
+                            if len(item) >= 2 and isinstance(item[1], str) and item[1] == comfyui_job_id:
+                                return True
+            return False
+        except Exception as e:
+            logger.debug(f"Error checking queue status: {e}")
+            return False
+
     async def wait_for_completion_websocket(self, comfyui_job_id: str, request_id: str) -> Dict[str, Any]:
         """
         Wait for ComfyUI job completion using WebSocket connection
@@ -360,52 +382,48 @@ class GenerationWorker:
                         except asyncio.TimeoutError:
                             no_message_retry_count += 1
                             elapsed = asyncio.get_event_loop().time() - start_time
-                            
-                            # If we haven't received any messages, try to check job status before giving up
-                            if last_message_time == start_time:
-                                logger.warning(f"No WebSocket messages received for {comfyui_job_id} "
-                                            f"(attempt {no_message_retry_count}/{max_no_message_retries}) "
-                                            f"after {elapsed:.1f}s - checking job status")
-                                
-                                # Check if the job is complete/cached
-                                try:
-                                    if await self.check_if_cached(comfyui_job_id):
-                                        logger.info(f"Job {comfyui_job_id} is complete (cached)")
-                                        execution_result["completed"] = True
-                                        execution_result["cached"] = True
-                                        return execution_result
-                                except Exception as check_error:
-                                    logger.warning(f"Error checking job status: {check_error}")
-                                
-                                # If we've exhausted retries, give up
-                                if no_message_retry_count >= max_no_message_retries:
-                                    logger.error(f"No WebSocket messages received for {comfyui_job_id} "
-                                            f"after {max_no_message_retries} attempts and {elapsed:.1f}s")
-                                    raise Exception(f"No WebSocket messages received for job {comfyui_job_id} "
-                                                f"after {max_no_message_retries} retry attempts")
-                                
-                                # Wait a bit before retrying (exponential backoff)
-                                wait_time = min(5 * (2 ** (no_message_retry_count - 1)), 30)  # Cap at 30 seconds
-                                logger.info(f"Waiting {wait_time}s before retry {no_message_retry_count + 1}")
-                                await asyncio.sleep(wait_time)
-                                
-                            else:
-                                # We were receiving messages but they stopped
-                                logger.warning(f"WebSocket message timeout for job {comfyui_job_id} "
-                                            f"(no message for {timeout_duration}s, elapsed: {elapsed:.1f}s)")
-                                
-                                # Try to check job status before giving up completely
-                                try:
-                                    if await self.check_if_cached(comfyui_job_id):
-                                        logger.info(f"Job {comfyui_job_id} completed despite message timeout")
-                                        execution_result["completed"] = True
-                                        return execution_result
-                                except Exception as check_error:
-                                    logger.warning(f"Error checking job status after timeout: {check_error}")
-                                
-                                # If still no completion after timeout, raise error
-                                raise Exception(f"WebSocket message timeout for job {comfyui_job_id} "
-                                            f"after {timeout_duration} seconds without messages")
+
+                            source = "initial" if last_message_time == start_time else "ongoing"
+                            logger.warning(f"WebSocket timeout ({source}) for {comfyui_job_id} "
+                                        f"(attempt {no_message_retry_count}/{max_no_message_retries}) "
+                                        f"after {elapsed:.1f}s - checking job status")
+
+                            # Check if the job is already complete
+                            try:
+                                if await self.check_if_cached(comfyui_job_id):
+                                    logger.info(f"Job {comfyui_job_id} is complete (found in history)")
+                                    execution_result["completed"] = True
+                                    return execution_result
+                            except Exception as check_error:
+                                logger.warning(f"Error checking job history: {check_error}")
+
+                            # Check if ComfyUI is still working on this job
+                            still_running = False
+                            try:
+                                still_running = await self.check_if_running(comfyui_job_id)
+                            except Exception as check_error:
+                                logger.warning(f"Error checking queue status: {check_error}")
+
+                            if still_running:
+                                # Job is still in ComfyUI queue/running — keep waiting
+                                logger.info(f"Job {comfyui_job_id} still running in ComfyUI — "
+                                          f"continuing to wait (elapsed: {elapsed:.1f}s)")
+                                no_message_retry_count = 0  # Reset retries, ComfyUI is alive
+                                await asyncio.sleep(10)
+                                continue
+
+                            # Job is NOT in queue and NOT in history — genuine failure
+                            if no_message_retry_count >= max_no_message_retries:
+                                logger.error(f"Job {comfyui_job_id} not found in queue or history "
+                                        f"after {max_no_message_retries} attempts and {elapsed:.1f}s")
+                                raise Exception(f"Job {comfyui_job_id} disappeared from ComfyUI "
+                                            f"after {no_message_retry_count} attempts")
+
+                            # Wait before retrying (exponential backoff)
+                            wait_time = min(5 * (2 ** (no_message_retry_count - 1)), 30)
+                            logger.info(f"Job not found in queue, waiting {wait_time}s before retry "
+                                      f"{no_message_retry_count + 1}/{max_no_message_retries}")
+                            await asyncio.sleep(wait_time)
                         
                         # Check for overall timeout
                         elapsed = asyncio.get_event_loop().time() - start_time
