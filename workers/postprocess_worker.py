@@ -3,9 +3,25 @@ import asyncio
 import logging
 import os  # Still needed for symlink and remove operations
 import shutil
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
+
+
+def _looks_like_request_id(name: str) -> bool:
+    """Return True if ``name`` matches the UUID format used for request IDs.
+
+    Used by the stale-cache guard in ``_process_output_file`` to decide
+    whether a non-self path component is "another request's directory"
+    (UUID-shaped — refuse) vs. a workflow-author subfolder convention
+    such as ``video/`` or ``images/`` (not UUID-shaped — accept).
+    """
+    try:
+        uuid.UUID(str(name))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 import aiobotocore.session
 import aiofiles
@@ -259,9 +275,57 @@ class PostprocessWorker:
             
             # Get the real path (in case original_path is a symlink from a cached result)
             real_original_path = original_path.resolve()
-            
-            logger.info(f"Copying {real_original_path} to {dest_path}")
-            
+
+            # Defensive: when ComfyUI's history points at a path that
+            # has been symlinked from a previous job's directory, we'd
+            # otherwise copy that prior job's file as if it were ours.
+            # Reject only when the first path segment is a UUID-shaped
+            # request id that isn't ours — that's the actual stale-cache
+            # case. Non-UUID subfolders (workflow filename_prefix
+            # conventions like ``video/`` or ``images/``) are allowed
+            # through; rejecting them silently dropped legitimate
+            # outputs of any workflow that organised files into named
+            # subfolders.
+            try:
+                rel = real_original_path.relative_to(self.output_dir)
+                rel_parts = rel.parts
+                if (
+                    len(rel_parts) > 1
+                    and _looks_like_request_id(rel_parts[0])
+                    and rel_parts[0] != str(request_id)
+                ):
+                    logger.debug(f"Skipping source from different request directory: {real_original_path}")
+                    return None
+            except Exception:
+                pass  # not under OUTPUT_DIR — let the original path through
+
+            # Same-file shortcut. When a request_id is reused AND
+            # ComfyUI's prompt cache hits with the same outputs,
+            # `original_path` is the symlink we wrote on the prior
+            # run; `original_path.resolve()` follows it into the
+            # per-request directory, where `dest_path` ALSO points.
+            # `shutil.copy2` would raise `SameFileError`. The file is
+            # already in the right place — return the result entry
+            # immediately and skip copy/symlink dance.
+            try:
+                if real_original_path == dest_path.resolve(strict=False):
+                    logger.info(
+                        f"Output {filename} already at destination "
+                        f"({real_original_path}); skipping copy"
+                    )
+                    return {
+                        "filename": filename,
+                        "local_path": str(dest_path),
+                        "type": file_type,
+                        "subfolder": subfolder,
+                        "node_id": node_id,
+                        "output_type": output_type,
+                    }
+            except Exception:
+                pass  # fall through to the copy
+
+            logger.debug(f"Copying {real_original_path} to {dest_path}")
+
             # Copy the file (using real path to handle symlinks)
             await self._copy_file_async(real_original_path, dest_path)
             
