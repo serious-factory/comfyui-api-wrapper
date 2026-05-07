@@ -69,6 +69,37 @@ generation_queue = asyncio.Queue()
 postprocess_queue = asyncio.Queue()
 
 
+# Substrings that classify a failed Result.message as an upstream
+# connectivity / timeout problem rather than a workflow/runtime failure.
+_UPSTREAM_FAIL_HINTS = (
+    "cannot connect",
+    "failed to post workflow after",
+    "network error",
+    "connection refused",
+    "websocket timeout",
+    "websocket failure",
+    "timed out",
+)
+
+
+def _http_status_for(result) -> int:
+    """Map terminal result statuses to HTTP status codes.
+
+    - completed -> 200
+    - cancelled -> 499
+    - failed/timeout -> 502 for upstream connectivity failures, else 500
+    """
+    status = getattr(result, "status", None)
+    if status == "completed":
+        return 200
+    if status == "cancelled":
+        return 499
+
+    msg = (getattr(result, "message", "") or "").lower()
+    if any(hint in msg for hint in _UPSTREAM_FAIL_HINTS):
+        return 502
+    return 500
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize workers on startup"""
@@ -401,6 +432,7 @@ async def generate_sync(
             while True:
                 result = await response_store.get(request_id)
                 if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
+                    response.status_code = _http_status_for(result)
                     return result
                 await asyncio.sleep(0.5)
 
@@ -666,7 +698,9 @@ async def result(request_id: str, response: Response):
         if not result:
             result = Result(id=request_id, status="failed", message="Request ID not found")
             response.status_code = 404
-        
+
+        if result.status in ["completed", "failed", "timeout", "cancelled"]:
+            response.status_code = _http_status_for(result)
         return result
     except Exception as e:
         logger.error(f"Failed to get result for {request_id}: {e}")
