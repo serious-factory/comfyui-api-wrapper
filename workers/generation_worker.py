@@ -5,6 +5,7 @@ import json
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
+import time
 
 from config import (
     COMFYUI_API_PROMPT,
@@ -16,6 +17,10 @@ from config import (
     WEBSOCKET_MESSAGE_TIMEOUT,
     WEBSOCKET_MAX_NO_MESSAGE_RETRIES,
     WEBSOCKET_MAX_WAIT_TIME,
+    WEBHOOK_CONFIG,
+    WEBHOOK_ENABLED,
+    PROGRESS_WEBHOOK_MIN_INTERVAL_SECONDS,
+    PROGRESS_WEBHOOK_MIN_PERCENT_DELTA,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +42,9 @@ class GenerationWorker:
         self.max_wait_time = WEBSOCKET_MAX_WAIT_TIME
         self.ws_url = COMFYUI_API_WEBSOCKET
         self.client_id = f"worker_{worker_id}_{datetime.now().timestamp()}"
+        self.progress_min_interval_seconds = PROGRESS_WEBHOOK_MIN_INTERVAL_SECONDS
+        self.progress_min_percent_delta = PROGRESS_WEBHOOK_MIN_PERCENT_DELTA
+        self._progress_webhook_state: Dict[str, Dict[str, Any]] = {}
 
     async def work(self):
         logger.info(f"GenerationWorker {self.worker_id}: waiting for jobs")
@@ -76,6 +84,17 @@ class GenerationWorker:
                 result.message = f"Generation started (ComfyUI job: {comfyui_job_id})"
                 await self.response_store.set(request_id, result)
 
+                webhook_config = await self.get_webhook_config(request.input)
+                await self.maybe_send_progress_webhook(
+                    request_id=request_id,
+                    result_id=getattr(result, "id", request_id),
+                    webhook_config=webhook_config,
+                    message="Generation started",
+                    progress=None,
+                    force=True,
+                    event="progress",
+                )
+
                 # Check if job is already complete (cached result)
                 is_cached = await self.check_if_cached(comfyui_job_id)
                 
@@ -93,7 +112,9 @@ class GenerationWorker:
                     # Wait for completion using WebSocket
                     execution_result = await self.wait_for_completion_websocket(
                         comfyui_job_id, 
-                        request_id
+                        request_id,
+                        webhook_config=webhook_config,
+                        result_id=getattr(result, "id", request_id),
                     )
                 
                 # Get the final result from ComfyUI history
@@ -135,6 +156,7 @@ class GenerationWorker:
             
             finally:
                 # Mark the job as complete
+                self._progress_webhook_state.pop(request_id, None)
                 self.generation_queue.task_done()
 
         logger.info(f"GenerationWorker {self.worker_id} finished")
@@ -235,7 +257,13 @@ class GenerationWorker:
             logger.debug(f"Error checking queue status: {e}")
             return False
 
-    async def wait_for_completion_websocket(self, comfyui_job_id: str, request_id: str) -> Dict[str, Any]:
+    async def wait_for_completion_websocket(
+        self,
+        comfyui_job_id: str,
+        request_id: str,
+        webhook_config: Optional[Dict[str, Any]] = None,
+        result_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Wait for ComfyUI job completion using WebSocket connection.
         Reconnects automatically if the WebSocket closes while the job is still running.
@@ -257,7 +285,12 @@ class GenerationWorker:
 
             try:
                 completed = await self._ws_listen_loop(
-                    comfyui_job_id, request_id, execution_result, start_time
+                    comfyui_job_id,
+                    request_id,
+                    execution_result,
+                    start_time,
+                    webhook_config=webhook_config,
+                    result_id=result_id,
                 )
                 if completed:
                     return execution_result
@@ -335,7 +368,9 @@ class GenerationWorker:
 
     async def _ws_listen_loop(
         self, comfyui_job_id: str, request_id: str,
-        execution_result: Dict[str, Any], start_time: float
+        execution_result: Dict[str, Any], start_time: float,
+        webhook_config: Optional[Dict[str, Any]] = None,
+        result_id: Optional[str] = None,
     ) -> bool:
         """
         Single WebSocket connection listen loop.
@@ -392,6 +427,15 @@ class GenerationWorker:
                                     if message_type == "execution_start":
                                         logger.info(f"Execution started for {comfyui_job_id}")
                                         await self._update_progress(request_id, "Execution started...")
+                                        await self.maybe_send_progress_webhook(
+                                            request_id=request_id,
+                                            result_id=result_id or request_id,
+                                            webhook_config=webhook_config,
+                                            message="Execution started",
+                                            progress=None,
+                                            force=True,
+                                            event="progress",
+                                        )
 
                                     elif message_type == "execution_cached":
                                         nodes = data.get("data", {}).get("nodes", [])
@@ -404,6 +448,15 @@ class GenerationWorker:
                                             logger.info(f"Executing node: {node}")
                                             execution_result["nodes_executed"].append(node)
                                             await self._update_progress(request_id, f"Processing node: {node}")
+                                            await self.maybe_send_progress_webhook(
+                                                request_id=request_id,
+                                                result_id=result_id or request_id,
+                                                webhook_config=webhook_config,
+                                                message=f"Processing node: {node}",
+                                                progress=None,
+                                                force=False,
+                                                event="progress",
+                                            )
                                         elif data.get("data", {}).get("node") is None:
                                             logger.info(f"Execution complete for {comfyui_job_id}")
                                             execution_result["completed"] = True
@@ -426,6 +479,19 @@ class GenerationWorker:
                                         if current_time - last_update_time > 2:
                                             await self._update_progress(request_id, progress_msg)
                                             last_update_time = current_time
+                                        await self.maybe_send_progress_webhook(
+                                            request_id=request_id,
+                                            result_id=result_id or request_id,
+                                            webhook_config=webhook_config,
+                                            message=progress_msg,
+                                            progress={
+                                                "value": value,
+                                                "max": max_value,
+                                                "percent": round(progress_pct, 1),
+                                            },
+                                            force=False,
+                                            event="progress",
+                                        )
 
                                     elif message_type == "execution_error":
                                         error_data = data.get("data", {})
@@ -509,6 +575,98 @@ class GenerationWorker:
                 await self.response_store.set(request_id, result)
         except Exception as e:
             logger.warning(f"Failed to update progress for {request_id}: {e}")
+
+    async def maybe_send_progress_webhook(
+        self,
+        request_id: str,
+        result_id: str,
+        webhook_config: Optional[Dict[str, Any]],
+        message: str,
+        progress: Optional[Dict[str, Any]],
+        force: bool = False,
+        event: str = "progress",
+    ) -> None:
+        if not webhook_config or not webhook_config.get("url"):
+            return
+
+        now = time.monotonic()
+        state = self._progress_webhook_state.get(request_id, {})
+        last_sent_at = float(state.get("last_sent_at", 0.0))
+        last_percent = state.get("last_percent")
+        current_percent = None if not progress else progress.get("percent")
+
+        if not force:
+            interval_ok = (now - last_sent_at) >= self.progress_min_interval_seconds
+            delta_ok = False
+            if isinstance(current_percent, (int, float)):
+                if not isinstance(last_percent, (int, float)):
+                    delta_ok = True
+                else:
+                    delta_ok = abs(float(current_percent) - float(last_percent)) >= self.progress_min_percent_delta
+            if not interval_ok and not delta_ok:
+                return
+
+        payload = {
+            "id": result_id,
+            "event": event,
+            "status": "processing",
+            "message": message,
+            "progress": progress,
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }
+
+        extra_params = webhook_config.get("extra_params", {}) if webhook_config else {}
+        if extra_params:
+            payload.update(extra_params)
+
+        await self.send_webhook_payload(
+            webhook_url=webhook_config["url"],
+            payload=payload,
+            timeout_seconds=int(webhook_config.get("timeout", WEBHOOK_CONFIG.get("timeout", 30))),
+        )
+
+        self._progress_webhook_state[request_id] = {
+            "last_sent_at": now,
+            "last_percent": current_percent,
+        }
+
+    async def send_webhook_payload(self, webhook_url: str, payload: Dict[str, Any], timeout_seconds: int = 30) -> None:
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    webhook_url,
+                    json=payload,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        logger.warning(f"Progress webhook failed (status {response.status}): {error_text}")
+        except Exception as e:
+            logger.warning(f"Failed to send progress webhook: {e}")
+
+    async def get_webhook_config(self, input_data) -> Optional[Dict]:
+        """Get webhook configuration from payload or centralized config (from environment)."""
+        try:
+            if hasattr(input_data, 'webhook') and input_data.webhook:
+                if input_data.webhook.has_valid_url():
+                    return {
+                        'url': input_data.webhook.url,
+                        'extra_params': input_data.webhook.extra_params,
+                        'timeout': input_data.webhook.timeout
+                    }
+
+            if WEBHOOK_ENABLED:
+                return {
+                    'url': WEBHOOK_CONFIG["url"],
+                    'extra_params': {},
+                    'timeout': WEBHOOK_CONFIG["timeout"]
+                }
+
+            return None
+        except Exception as e:
+            logger.warning(f"Error getting webhook config for progress updates: {e}")
+            return None
 
     async def get_result(self, comfyui_job_id: str) -> Optional[dict]:
         """Get the final result from ComfyUI history"""

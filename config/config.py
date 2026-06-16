@@ -61,6 +61,14 @@ WEBHOOK_CONFIG = {
     "timeout": int(os.getenv("WEBHOOK_TIMEOUT", "30"))
 }
 
+# Progress webhook throttling
+PROGRESS_WEBHOOK_MIN_INTERVAL_SECONDS = float(
+    os.getenv("PROGRESS_WEBHOOK_MIN_INTERVAL_SECONDS", "2")
+)
+PROGRESS_WEBHOOK_MIN_PERCENT_DELTA = float(
+    os.getenv("PROGRESS_WEBHOOK_MIN_PERCENT_DELTA", "2")
+)
+
 # Check if webhook is configured via environment
 WEBHOOK_ENABLED = bool(WEBHOOK_CONFIG["url"])
 
