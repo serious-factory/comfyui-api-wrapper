@@ -518,6 +518,7 @@ class GenerationWorker:
                                     value = progress_data.get("value", 0)
                                     max_value = progress_data.get("max", 100)
                                     progress_pct = (value / max_value * 100) if max_value > 0 else 0
+                                    self._mark_progress_cycle_completion(request_id, value, max_value)
                                     global_progress_payload = self._build_global_progress_payload(request_id, value=value, max_value=max_value)
                                     global_percent = global_progress_payload.get("percent", 0)
                                     progress_msg = self._format_global_stage_message(request_id, global_percent)
@@ -699,6 +700,9 @@ class GenerationWorker:
             "milestone_nodes": milestone_nodes,
             "milestones_total": len(milestone_nodes),
             "milestones_done": set(),
+            # Fallback counter when websocket executed events are sparse/missing.
+            "synthetic_milestones_done": 0,
+            "cycle_completion_latched": False,
             "last_global_percent": 0,
         }
 
@@ -764,6 +768,35 @@ class GenerationWorker:
         milestones_done: Set[str] = state.setdefault("milestones_done", set())
         milestones_done.add(node_key)
 
+    def _mark_progress_cycle_completion(self, request_id: str, value: Any, max_value: Any) -> None:
+        state = self._global_progress_state.get(request_id)
+        if not state:
+            return
+
+        try:
+            value_f = float(value)
+            max_f = float(max_value)
+        except (TypeError, ValueError):
+            return
+
+        if max_f <= 0:
+            return
+
+        # Reset latch as soon as a new cycle starts.
+        if value_f < max_f:
+            state["cycle_completion_latched"] = False
+            return
+
+        if state.get("cycle_completion_latched", False):
+            return
+
+        state["cycle_completion_latched"] = True
+        synthetic_done = int(state.get("synthetic_milestones_done", 0)) + 1
+        total = int(state.get("milestones_total", 0))
+        if total > 0:
+            synthetic_done = min(synthetic_done, total)
+        state["synthetic_milestones_done"] = synthetic_done
+
     def _build_global_progress_payload(
         self,
         request_id: str,
@@ -776,6 +809,8 @@ class GenerationWorker:
 
         milestones_total = int(state.get("milestones_total", 0))
         milestones_done_count = len(state.get("milestones_done", set()))
+        synthetic_done_count = int(state.get("synthetic_milestones_done", 0))
+        milestones_done_count = max(milestones_done_count, synthetic_done_count)
 
         local_pct = 0.0
         if isinstance(value, (int, float)) and isinstance(max_value, (int, float)) and max_value > 0:
