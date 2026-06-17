@@ -682,7 +682,11 @@ class GenerationWorker:
         if not isinstance(workflow_json, dict):
             return []
 
+        # Priority 1 (native workflow): one milestone per WanInfiniteTalkToVideo node.
+        wan_nodes: List[tuple[int, str]] = []
+        # Priority 2: explicit "Pass N" titles.
         pass_nodes: Dict[int, tuple[int, str]] = {}
+        # Fallback: sampler-type nodes.
         sampler_candidates: List[tuple[int, str]] = []
 
         for node_id, node_data in workflow_json.items():
@@ -698,6 +702,10 @@ class GenerationWorker:
             except ValueError:
                 order = 10**9
 
+            if class_type == "waninfinitetalktovideo":
+                wan_nodes.append((order, node_key))
+                continue
+
             match = re.search(r"\bpass\s*(\d+)\b", title)
             if match:
                 pass_index = int(match.group(1))
@@ -706,8 +714,12 @@ class GenerationWorker:
                     pass_nodes[pass_index] = (order, node_key)
                 continue
 
-            if class_type in {"ksampler", "ksampleradvanced", "samplercustom"}:
+            if class_type in {"ksampler", "ksampleradvanced", "samplercustom", "samplercustomadvanced"}:
                 sampler_candidates.append((order, node_key))
+
+        if len(wan_nodes) >= 2:
+            wan_nodes.sort(key=lambda item: item[0])
+            return [node_key for _, node_key in wan_nodes]
 
         if pass_nodes:
             return [node_key for _, node_key in sorted(pass_nodes.values(), key=lambda item: item[0])]
