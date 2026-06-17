@@ -399,6 +399,7 @@ class GenerationWorker:
                 last_update_time = asyncio.get_event_loop().time()
                 last_message_time = start_time
                 last_cancellation_check = start_time
+                execution_started = False
 
                 while True:
                     try:
@@ -426,124 +427,147 @@ class GenerationWorker:
                                 message_type = data.get("type")
                                 logger.debug(f"WebSocket message type: {message_type}")
 
-                                if data.get("data", {}).get("prompt_id") == comfyui_job_id:
+                                message_data = data.get("data", {}) if isinstance(data, dict) else {}
+                                msg_prompt_id = message_data.get("prompt_id")
+                                has_matching_prompt = msg_prompt_id == comfyui_job_id
+                                can_use_implicit_prompt = (
+                                    execution_started
+                                    and msg_prompt_id is None
+                                    and message_type in {"executing", "executed", "progress", "execution_error", "execution_cached"}
+                                )
 
-                                    if message_type == "execution_start":
-                                        logger.info(f"Execution started for {comfyui_job_id}")
-                                        await self._update_progress(request_id, "Execution started...")
-                                        start_progress = self._build_global_progress_payload(request_id)
+                                if not has_matching_prompt and not can_use_implicit_prompt:
+                                    continue
+
+                                if can_use_implicit_prompt and not has_matching_prompt:
+                                    logger.debug(
+                                        "Accepting %s without prompt_id for active job %s",
+                                        message_type,
+                                        comfyui_job_id,
+                                    )
+
+                                if has_matching_prompt and message_type in {
+                                    "execution_start", "execution_cached", "executing", "executed", "progress", "execution_error"
+                                }:
+                                    execution_started = True
+
+                                if message_type == "execution_start":
+                                    execution_started = True
+                                    logger.info(f"Execution started for {comfyui_job_id}")
+                                    await self._update_progress(request_id, "Execution started...")
+                                    start_progress = self._build_global_progress_payload(request_id)
+                                    await self.maybe_send_progress_webhook(
+                                        request_id=request_id,
+                                        result_id=result_id or request_id,
+                                        webhook_config=webhook_config,
+                                        message="Execution started",
+                                        progress=start_progress,
+                                        force=True,
+                                        event="progress",
+                                    )
+
+                                elif message_type == "execution_cached":
+                                    nodes = data.get("data", {}).get("nodes", [])
+                                    logger.info(f"Using cached results for nodes: {nodes}")
+                                    execution_result["nodes_executed"].extend(nodes)
+
+                                elif message_type == "executing":
+                                    node = data.get("data", {}).get("node")
+                                    if node:
+                                        logger.info(f"Executing node: {node}")
+                                        execution_result["nodes_executed"].append(node)
+                                        progress_payload = self._build_global_progress_payload(request_id)
+                                        stage_message = self._format_global_stage_message(request_id)
+                                        await self._update_progress(request_id, stage_message)
                                         await self.maybe_send_progress_webhook(
                                             request_id=request_id,
                                             result_id=result_id or request_id,
                                             webhook_config=webhook_config,
-                                            message="Execution started",
-                                            progress=start_progress,
-                                            force=True,
-                                            event="progress",
-                                        )
-
-                                    elif message_type == "execution_cached":
-                                        nodes = data.get("data", {}).get("nodes", [])
-                                        logger.info(f"Using cached results for nodes: {nodes}")
-                                        execution_result["nodes_executed"].extend(nodes)
-
-                                    elif message_type == "executing":
-                                        node = data.get("data", {}).get("node")
-                                        if node:
-                                            logger.info(f"Executing node: {node}")
-                                            execution_result["nodes_executed"].append(node)
-                                            progress_payload = self._build_global_progress_payload(request_id)
-                                            stage_message = self._format_global_stage_message(request_id)
-                                            await self._update_progress(request_id, stage_message)
-                                            await self.maybe_send_progress_webhook(
-                                                request_id=request_id,
-                                                result_id=result_id or request_id,
-                                                webhook_config=webhook_config,
-                                                message=stage_message,
-                                                progress=progress_payload,
-                                                force=False,
-                                                event="progress",
-                                            )
-                                        elif data.get("data", {}).get("node") is None:
-                                            final_progress = self._build_global_progress_payload(request_id)
-                                            final_percent = int(final_progress.get("percent", 0))
-                                            if final_percent < 95:
-                                                final_percent = 95
-                                                state = self._global_progress_state.get(request_id)
-                                                if state is not None:
-                                                    state["last_global_percent"] = final_percent
-                                                final_progress["percent"] = final_percent
-                                                final_progress["global_percent"] = final_percent
-                                            final_message = self._format_global_stage_message(request_id, final_percent)
-                                            await self._update_progress(request_id, final_message)
-                                            await self.maybe_send_progress_webhook(
-                                                request_id=request_id,
-                                                result_id=result_id or request_id,
-                                                webhook_config=webhook_config,
-                                                message=final_message,
-                                                progress=final_progress,
-                                                force=True,
-                                                event="progress",
-                                            )
-                                            logger.info(f"Execution complete for {comfyui_job_id}")
-                                            execution_result["completed"] = True
-                                            return True
-
-                                    elif message_type == "progress":
-                                        progress_data = data.get("data", {})
-                                        value = progress_data.get("value", 0)
-                                        max_value = progress_data.get("max", 100)
-                                        progress_pct = (value / max_value * 100) if max_value > 0 else 0
-                                        global_progress_payload = self._build_global_progress_payload(request_id, value=value, max_value=max_value)
-                                        global_percent = global_progress_payload.get("percent", 0)
-                                        progress_msg = self._format_global_stage_message(request_id, global_percent)
-                                        logger.info(f"Progress update: {progress_msg} ({value}/{max_value})")
-                                        execution_result["progress_updates"].append({
-                                            "time": asyncio.get_event_loop().time() - start_time,
-                                            "value": value,
-                                            "max": max_value,
-                                            "percentage": progress_pct
-                                        })
-                                        current_time = asyncio.get_event_loop().time()
-                                        if current_time - last_update_time > 2:
-                                            await self._update_progress(request_id, progress_msg)
-                                            last_update_time = current_time
-                                        await self.maybe_send_progress_webhook(
-                                            request_id=request_id,
-                                            result_id=result_id or request_id,
-                                            webhook_config=webhook_config,
-                                            message=progress_msg,
-                                            progress=global_progress_payload,
+                                            message=stage_message,
+                                            progress=progress_payload,
                                             force=False,
                                             event="progress",
                                         )
-
-                                    elif message_type == "execution_error":
-                                        error_data = data.get("data", {})
-                                        error_msg = f"Execution error: {error_data}"
-                                        logger.error(error_msg)
-                                        execution_result["error"] = error_data
-                                        raise Exception(error_msg)
-
-                                    elif message_type == "executed":
-                                        node = data.get("data", {}).get("node")
-                                        output = data.get("data", {}).get("output")
-                                        self._mark_executed_milestone(request_id, node)
-                                        milestone_progress = self._build_global_progress_payload(request_id)
-                                        milestone_percent = milestone_progress.get("percent", 0)
-                                        milestone_message = self._format_global_stage_message(request_id, milestone_percent)
-                                        await self._update_progress(request_id, milestone_message)
+                                    elif data.get("data", {}).get("node") is None:
+                                        final_progress = self._build_global_progress_payload(request_id)
+                                        final_percent = int(final_progress.get("percent", 0))
+                                        if final_percent < 95:
+                                            final_percent = 95
+                                            state = self._global_progress_state.get(request_id)
+                                            if state is not None:
+                                                state["last_global_percent"] = final_percent
+                                            final_progress["percent"] = final_percent
+                                            final_progress["global_percent"] = final_percent
+                                        final_message = self._format_global_stage_message(request_id, final_percent)
+                                        await self._update_progress(request_id, final_message)
                                         await self.maybe_send_progress_webhook(
                                             request_id=request_id,
                                             result_id=result_id or request_id,
                                             webhook_config=webhook_config,
-                                            message=milestone_message,
-                                            progress=milestone_progress,
+                                            message=final_message,
+                                            progress=final_progress,
                                             force=True,
                                             event="progress",
                                         )
-                                        logger.info(f"Node {node} executed successfully")
-                                        logger.debug(f"Node output: {json.dumps(output, indent=2)[:500]}...")
+                                        logger.info(f"Execution complete for {comfyui_job_id}")
+                                        execution_result["completed"] = True
+                                        return True
+
+                                elif message_type == "progress":
+                                    progress_data = data.get("data", {})
+                                    value = progress_data.get("value", 0)
+                                    max_value = progress_data.get("max", 100)
+                                    progress_pct = (value / max_value * 100) if max_value > 0 else 0
+                                    global_progress_payload = self._build_global_progress_payload(request_id, value=value, max_value=max_value)
+                                    global_percent = global_progress_payload.get("percent", 0)
+                                    progress_msg = self._format_global_stage_message(request_id, global_percent)
+                                    logger.info(f"Progress update: {progress_msg} ({value}/{max_value})")
+                                    execution_result["progress_updates"].append({
+                                        "time": asyncio.get_event_loop().time() - start_time,
+                                        "value": value,
+                                        "max": max_value,
+                                        "percentage": progress_pct
+                                    })
+                                    current_time = asyncio.get_event_loop().time()
+                                    if current_time - last_update_time > 2:
+                                        await self._update_progress(request_id, progress_msg)
+                                        last_update_time = current_time
+                                    await self.maybe_send_progress_webhook(
+                                        request_id=request_id,
+                                        result_id=result_id or request_id,
+                                        webhook_config=webhook_config,
+                                        message=progress_msg,
+                                        progress=global_progress_payload,
+                                        force=False,
+                                        event="progress",
+                                    )
+
+                                elif message_type == "execution_error":
+                                    error_data = data.get("data", {})
+                                    error_msg = f"Execution error: {error_data}"
+                                    logger.error(error_msg)
+                                    execution_result["error"] = error_data
+                                    raise Exception(error_msg)
+
+                                elif message_type == "executed":
+                                    node = data.get("data", {}).get("node")
+                                    output = data.get("data", {}).get("output")
+                                    self._mark_executed_milestone(request_id, node)
+                                    milestone_progress = self._build_global_progress_payload(request_id)
+                                    milestone_percent = milestone_progress.get("percent", 0)
+                                    milestone_message = self._format_global_stage_message(request_id, milestone_percent)
+                                    await self._update_progress(request_id, milestone_message)
+                                    await self.maybe_send_progress_webhook(
+                                        request_id=request_id,
+                                        result_id=result_id or request_id,
+                                        webhook_config=webhook_config,
+                                        message=milestone_message,
+                                        progress=milestone_progress,
+                                        force=True,
+                                        event="progress",
+                                    )
+                                    logger.info(f"Node {node} executed successfully")
+                                    logger.debug(f"Node output: {json.dumps(output, indent=2)[:500]}...")
 
                             except json.JSONDecodeError as e:
                                 logger.warning(f"Failed to parse WebSocket message: {e}")
