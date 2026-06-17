@@ -728,21 +728,8 @@ class GenerationWorker:
         return payload
 
     def _format_global_stage_message(self, request_id: str, global_percent: Optional[int] = None) -> str:
-        state = self._global_progress_state.get(request_id)
-        if not state:
-            return "Generating video" if global_percent is None else f"Generating video {global_percent}%"
-
-        milestones_total = int(state.get("milestones_total", 0))
-        milestones_done_count = len(state.get("milestones_done", set()))
-        current_pass = min(milestones_total, milestones_done_count + 1) if milestones_total > 0 else 0
-
         if global_percent is None:
-            if milestones_total > 0:
-                return f"Generating pass {current_pass}/{milestones_total}"
             return "Generating video"
-
-        if milestones_total > 0:
-            return f"Generating pass {current_pass}/{milestones_total} {global_percent}%"
         return f"Generating video {global_percent}%"
 
     async def send_webhook_payload(self, webhook_url: str, payload: Dict[str, Any], timeout_seconds: int = 30) -> None:
