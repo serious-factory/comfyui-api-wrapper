@@ -508,6 +508,19 @@ class GenerationWorker:
                                         node = data.get("data", {}).get("node")
                                         output = data.get("data", {}).get("output")
                                         self._mark_executed_milestone(request_id, node)
+                                        milestone_progress = self._build_global_progress_payload(request_id)
+                                        milestone_percent = milestone_progress.get("percent", 0)
+                                        milestone_message = self._format_global_stage_message(request_id, milestone_percent)
+                                        await self._update_progress(request_id, milestone_message)
+                                        await self.maybe_send_progress_webhook(
+                                            request_id=request_id,
+                                            result_id=result_id or request_id,
+                                            webhook_config=webhook_config,
+                                            message=milestone_message,
+                                            progress=milestone_progress,
+                                            force=True,
+                                            event="progress",
+                                        )
                                         logger.info(f"Node {node} executed successfully")
                                         logger.debug(f"Node output: {json.dumps(output, indent=2)[:500]}...")
 
