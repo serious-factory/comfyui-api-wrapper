@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set, List
 from datetime import datetime
 import time
 
@@ -45,6 +45,7 @@ class GenerationWorker:
         self.progress_min_interval_seconds = PROGRESS_WEBHOOK_MIN_INTERVAL_SECONDS
         self.progress_min_percent_delta = PROGRESS_WEBHOOK_MIN_PERCENT_DELTA
         self._progress_webhook_state: Dict[str, Dict[str, Any]] = {}
+        self._global_progress_state: Dict[str, Dict[str, Any]] = {}
 
     async def work(self):
         logger.info(f"GenerationWorker {self.worker_id}: waiting for jobs")
@@ -85,6 +86,7 @@ class GenerationWorker:
                 await self.response_store.set(request_id, result)
 
                 webhook_config = await self.get_webhook_config(request.input)
+                self._global_progress_state[request_id] = self._init_global_progress_state(request.input.workflow_json)
                 await self.maybe_send_progress_webhook(
                     request_id=request_id,
                     result_id=getattr(result, "id", request_id),
@@ -157,6 +159,7 @@ class GenerationWorker:
             finally:
                 # Mark the job as complete
                 self._progress_webhook_state.pop(request_id, None)
+                self._global_progress_state.pop(request_id, None)
                 self.generation_queue.task_done()
 
         logger.info(f"GenerationWorker {self.worker_id} finished")
@@ -427,12 +430,13 @@ class GenerationWorker:
                                     if message_type == "execution_start":
                                         logger.info(f"Execution started for {comfyui_job_id}")
                                         await self._update_progress(request_id, "Execution started...")
+                                        start_progress = self._build_global_progress_payload(request_id)
                                         await self.maybe_send_progress_webhook(
                                             request_id=request_id,
                                             result_id=result_id or request_id,
                                             webhook_config=webhook_config,
                                             message="Execution started",
-                                            progress=None,
+                                            progress=start_progress,
                                             force=True,
                                             event="progress",
                                         )
@@ -447,13 +451,15 @@ class GenerationWorker:
                                         if node:
                                             logger.info(f"Executing node: {node}")
                                             execution_result["nodes_executed"].append(node)
-                                            await self._update_progress(request_id, f"Processing node: {node}")
+                                            progress_payload = self._build_global_progress_payload(request_id)
+                                            stage_message = self._format_global_stage_message(request_id)
+                                            await self._update_progress(request_id, stage_message)
                                             await self.maybe_send_progress_webhook(
                                                 request_id=request_id,
                                                 result_id=result_id or request_id,
                                                 webhook_config=webhook_config,
-                                                message=f"Processing node: {node}",
-                                                progress=None,
+                                                message=stage_message,
+                                                progress=progress_payload,
                                                 force=False,
                                                 event="progress",
                                             )
@@ -467,8 +473,10 @@ class GenerationWorker:
                                         value = progress_data.get("value", 0)
                                         max_value = progress_data.get("max", 100)
                                         progress_pct = (value / max_value * 100) if max_value > 0 else 0
-                                        progress_msg = f"Progress: {progress_pct:.1f}% ({value}/{max_value})"
-                                        logger.info(f"Progress update: {progress_msg}")
+                                        global_progress_payload = self._build_global_progress_payload(request_id, value=value, max_value=max_value)
+                                        global_percent = global_progress_payload.get("percent", 0)
+                                        progress_msg = self._format_global_stage_message(request_id, global_percent)
+                                        logger.info(f"Progress update: {progress_msg} ({value}/{max_value})")
                                         execution_result["progress_updates"].append({
                                             "time": asyncio.get_event_loop().time() - start_time,
                                             "value": value,
@@ -484,11 +492,7 @@ class GenerationWorker:
                                             result_id=result_id or request_id,
                                             webhook_config=webhook_config,
                                             message=progress_msg,
-                                            progress={
-                                                "value": value,
-                                                "max": max_value,
-                                                "percent": round(progress_pct, 1),
-                                            },
+                                            progress=global_progress_payload,
                                             force=False,
                                             event="progress",
                                         )
@@ -503,6 +507,7 @@ class GenerationWorker:
                                     elif message_type == "executed":
                                         node = data.get("data", {}).get("node")
                                         output = data.get("data", {}).get("output")
+                                        self._mark_executed_milestone(request_id, node)
                                         logger.info(f"Node {node} executed successfully")
                                         logger.debug(f"Node output: {json.dumps(output, indent=2)[:500]}...")
 
@@ -629,6 +634,116 @@ class GenerationWorker:
             "last_sent_at": now,
             "last_percent": current_percent,
         }
+
+    def _init_global_progress_state(self, workflow_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        milestone_nodes = self._extract_milestone_nodes(workflow_json)
+        return {
+            "milestone_nodes": milestone_nodes,
+            "milestones_total": len(milestone_nodes),
+            "milestones_done": set(),
+            "last_global_percent": 0,
+        }
+
+    def _extract_milestone_nodes(self, workflow_json: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(workflow_json, dict):
+            return []
+
+        milestone_candidates: List[tuple[int, str]] = []
+        for node_id, node_data in workflow_json.items():
+            node_key = str(node_id)
+            if not isinstance(node_data, dict):
+                continue
+            class_type = str(node_data.get("class_type", "")).lower()
+            title = str(node_data.get("_meta", {}).get("title", "")).lower()
+
+            is_pass_node = "pass" in title
+            is_sampler_node = "sampler" in class_type
+            if not (is_pass_node or is_sampler_node):
+                continue
+
+            try:
+                order = int(node_key)
+            except ValueError:
+                order = 10**9
+            milestone_candidates.append((order, node_key))
+
+        milestone_candidates.sort(key=lambda item: item[0])
+        return [node_key for _, node_key in milestone_candidates]
+
+    def _mark_executed_milestone(self, request_id: str, node: Any) -> None:
+        state = self._global_progress_state.get(request_id)
+        if not state:
+            return
+
+        node_key = str(node)
+        milestone_nodes = state.get("milestone_nodes", [])
+        if node_key not in milestone_nodes:
+            return
+
+        milestones_done: Set[str] = state.setdefault("milestones_done", set())
+        milestones_done.add(node_key)
+
+    def _build_global_progress_payload(
+        self,
+        request_id: str,
+        value: Optional[float] = None,
+        max_value: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        state = self._global_progress_state.get(request_id)
+        if not state:
+            return {"percent": 0}
+
+        milestones_total = int(state.get("milestones_total", 0))
+        milestones_done_count = len(state.get("milestones_done", set()))
+
+        local_pct = 0.0
+        if isinstance(value, (int, float)) and isinstance(max_value, (int, float)) and max_value > 0:
+            local_pct = max(0.0, min(100.0, (float(value) / float(max_value)) * 100.0))
+
+        if milestones_total > 0:
+            done_ratio = float(milestones_done_count) / float(milestones_total)
+            slice_size = 100.0 / float(milestones_total)
+            estimated = (done_ratio * 100.0) + ((local_pct / 100.0) * slice_size)
+        else:
+            estimated = local_pct
+
+        estimated = max(0.0, min(99.0, estimated))
+        # Quantize global progress to 5% steps (0,5,10,...,95) for stable UI updates.
+        quantized = int((estimated // 5.0) * 5)
+        previous = int(state.get("last_global_percent", 0))
+        global_percent = max(previous, quantized)
+        state["last_global_percent"] = global_percent
+
+        payload = {
+            "percent": global_percent,
+            "global_percent": global_percent,
+            "value": value,
+            "max": max_value,
+            "raw_percent": round(local_pct, 1),
+            "milestones": {
+                "done": milestones_done_count,
+                "total": milestones_total,
+            },
+        }
+        return payload
+
+    def _format_global_stage_message(self, request_id: str, global_percent: Optional[int] = None) -> str:
+        state = self._global_progress_state.get(request_id)
+        if not state:
+            return "Generating video" if global_percent is None else f"Generating video {global_percent}%"
+
+        milestones_total = int(state.get("milestones_total", 0))
+        milestones_done_count = len(state.get("milestones_done", set()))
+        current_pass = min(milestones_total, milestones_done_count + 1) if milestones_total > 0 else 0
+
+        if global_percent is None:
+            if milestones_total > 0:
+                return f"Generating pass {current_pass}/{milestones_total}"
+            return "Generating video"
+
+        if milestones_total > 0:
+            return f"Generating pass {current_pass}/{milestones_total} {global_percent}%"
+        return f"Generating video {global_percent}%"
 
     async def send_webhook_payload(self, webhook_url: str, payload: Dict[str, Any], timeout_seconds: int = 30) -> None:
         try:
