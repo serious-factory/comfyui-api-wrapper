@@ -6,6 +6,7 @@ import logging
 from typing import Optional, Dict, Any, Set, List
 from datetime import datetime
 import time
+import re
 
 from config import (
     COMFYUI_API_PROMPT,
@@ -464,6 +465,26 @@ class GenerationWorker:
                                                 event="progress",
                                             )
                                         elif data.get("data", {}).get("node") is None:
+                                            final_progress = self._build_global_progress_payload(request_id)
+                                            final_percent = int(final_progress.get("percent", 0))
+                                            if final_percent < 95:
+                                                final_percent = 95
+                                                state = self._global_progress_state.get(request_id)
+                                                if state is not None:
+                                                    state["last_global_percent"] = final_percent
+                                                final_progress["percent"] = final_percent
+                                                final_progress["global_percent"] = final_percent
+                                            final_message = self._format_global_stage_message(request_id, final_percent)
+                                            await self._update_progress(request_id, final_message)
+                                            await self.maybe_send_progress_webhook(
+                                                request_id=request_id,
+                                                result_id=result_id or request_id,
+                                                webhook_config=webhook_config,
+                                                message=final_message,
+                                                progress=final_progress,
+                                                force=True,
+                                                event="progress",
+                                            )
                                             logger.info(f"Execution complete for {comfyui_job_id}")
                                             execution_result["completed"] = True
                                             return True
@@ -661,27 +682,38 @@ class GenerationWorker:
         if not isinstance(workflow_json, dict):
             return []
 
-        milestone_candidates: List[tuple[int, str]] = []
+        pass_nodes: Dict[int, tuple[int, str]] = {}
+        sampler_candidates: List[tuple[int, str]] = []
+
         for node_id, node_data in workflow_json.items():
             node_key = str(node_id)
             if not isinstance(node_data, dict):
                 continue
+
             class_type = str(node_data.get("class_type", "")).lower()
             title = str(node_data.get("_meta", {}).get("title", "")).lower()
-
-            is_pass_node = "pass" in title
-            is_sampler_node = "sampler" in class_type
-            if not (is_pass_node or is_sampler_node):
-                continue
 
             try:
                 order = int(node_key)
             except ValueError:
                 order = 10**9
-            milestone_candidates.append((order, node_key))
 
-        milestone_candidates.sort(key=lambda item: item[0])
-        return [node_key for _, node_key in milestone_candidates]
+            match = re.search(r"\bpass\s*(\d+)\b", title)
+            if match:
+                pass_index = int(match.group(1))
+                current = pass_nodes.get(pass_index)
+                if current is None or order < current[0]:
+                    pass_nodes[pass_index] = (order, node_key)
+                continue
+
+            if class_type in {"ksampler", "ksampleradvanced", "samplercustom"}:
+                sampler_candidates.append((order, node_key))
+
+        if pass_nodes:
+            return [node_key for _, node_key in sorted(pass_nodes.values(), key=lambda item: item[0])]
+
+        sampler_candidates.sort(key=lambda item: item[0])
+        return [node_key for _, node_key in sampler_candidates]
 
     def _mark_executed_milestone(self, request_id: str, node: Any) -> None:
         state = self._global_progress_state.get(request_id)
