@@ -728,9 +728,8 @@ class GenerationWorker:
         return payload
 
     def _format_global_stage_message(self, request_id: str, global_percent: Optional[int] = None) -> str:
-        if global_percent is None:
-            return "Generating video"
-        return f"Generating video {global_percent}%"
+        # Keep message stable; UI should read numeric progress from payload.progress.percent.
+        return "Generating video"
 
     async def send_webhook_payload(self, webhook_url: str, payload: Dict[str, Any], timeout_seconds: int = 30) -> None:
         try:
