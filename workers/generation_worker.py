@@ -703,6 +703,7 @@ class GenerationWorker:
             # Fallback counter when websocket executed events are sparse/missing.
             "synthetic_milestones_done": 0,
             "cycle_completion_latched": False,
+            # Keep monotonicity across webhook updates.
             "last_global_percent": 0,
         }
 
@@ -817,15 +818,26 @@ class GenerationWorker:
             local_pct = max(0.0, min(100.0, (float(value) / float(max_value)) * 100.0))
 
         if milestones_total > 0:
-            done_ratio = float(milestones_done_count) / float(milestones_total)
-            slice_size = 100.0 / float(milestones_total)
-            estimated = (done_ratio * 100.0) + ((local_pct / 100.0) * slice_size)
+            # Pass-based global progress strategy:
+            # - 5% at start of first pass
+            # - 95% at end of last pass
+            # - each pass gets an equal slice of the 90% middle range
+            slice_size = 90.0 / float(milestones_total)
+            clamped_done = max(0, min(milestones_total, milestones_done_count))
+            local_ratio = local_pct / 100.0
+            estimated = 5.0 + ((float(clamped_done) + local_ratio) * slice_size)
+            estimated = min(95.0, estimated)
         else:
+            # No pass milestones available: fallback to local websocket progress.
             estimated = local_pct
 
-        estimated = max(0.0, min(99.0, estimated))
-        # Quantize global progress to 5% steps (0,5,10,...,95) for stable UI updates.
-        quantized = int((estimated // 5.0) * 5)
+        # Quantize progress to 1% steps for smoother, pass-aligned UI updates.
+        quantized = int(estimated)
+        if milestones_total > 0:
+            quantized = max(5, min(95, quantized))
+        else:
+            quantized = max(0, min(99, quantized))
+
         previous = int(state.get("last_global_percent", 0))
         global_percent = max(previous, quantized)
         state["last_global_percent"] = global_percent
