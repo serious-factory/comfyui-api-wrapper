@@ -518,15 +518,24 @@ class GenerationWorker:
                                     value = progress_data.get("value", 0)
                                     max_value = progress_data.get("max", 100)
                                     progress_pct = (value / max_value * 100) if max_value > 0 else 0
-                                    # Only use synthetic cycle completion when no explicit milestones exist.
-                                    state = self._global_progress_state.get(request_id, {})
-                                    milestones_total = int(state.get("milestones_total", 0))
-                                    if milestones_total <= 0:
-                                        self._mark_progress_cycle_completion(request_id, value, max_value)
+                                    # Always track cycle completion from websocket progress.
+                                    # This keeps progress moving even when executed milestones
+                                    # are sparse/missing for the chosen milestone nodes.
+                                    self._mark_progress_cycle_completion(request_id, value, max_value)
                                     global_progress_payload = self._build_global_progress_payload(request_id, value=value, max_value=max_value)
                                     global_percent = global_progress_payload.get("percent", 0)
                                     progress_msg = self._format_global_stage_message(request_id, global_percent)
-                                    logger.info(f"Progress update: {progress_msg} ({value}/{max_value})")
+                                    milestone_meta = global_progress_payload.get("milestones", {})
+                                    logger.info(
+                                        "Progress update: %s %s%% (%s/%s) [milestones %s/%s via %s]",
+                                        progress_msg,
+                                        global_percent,
+                                        value,
+                                        max_value,
+                                        milestone_meta.get("done"),
+                                        milestone_meta.get("total"),
+                                        milestone_meta.get("source"),
+                                    )
                                     execution_result["progress_updates"].append({
                                         "time": asyncio.get_event_loop().time() - start_time,
                                         "value": value,
@@ -704,9 +713,11 @@ class GenerationWorker:
             "milestone_nodes": milestone_nodes,
             "milestones_total": len(milestone_nodes),
             "milestones_done": set(),
-            # Fallback counter when websocket executed events are sparse/missing.
+            # Cycle counter from websocket progress(value/max) completions.
+            # Used as a resilient fallback when executed milestones do not fire.
             "synthetic_milestones_done": 0,
             "cycle_completion_latched": False,
+            "last_milestone_source": "none",
             # Keep monotonicity across webhook updates.
             "last_global_percent": 0,
         }
@@ -719,6 +730,8 @@ class GenerationWorker:
         wan_nodes: List[tuple[int, str]] = []
         # Priority 2: explicit "Pass N" titles.
         pass_nodes: Dict[int, tuple[int, str]] = {}
+        # Priority 3: video combine nodes (some workflows emit executed on these nodes only).
+        vhs_nodes: List[tuple[int, str]] = []
         # Fallback: sampler-type nodes.
         sampler_candidates: List[tuple[int, str]] = []
 
@@ -747,6 +760,10 @@ class GenerationWorker:
                     pass_nodes[pass_index] = (order, node_key)
                 continue
 
+            if class_type == "vhs_videocombine":
+                vhs_nodes.append((order, node_key))
+                continue
+
             if class_type in {"ksampler", "ksampleradvanced", "samplercustom", "samplercustomadvanced"}:
                 sampler_candidates.append((order, node_key))
 
@@ -756,6 +773,10 @@ class GenerationWorker:
 
         if pass_nodes:
             return [node_key for _, node_key in sorted(pass_nodes.values(), key=lambda item: item[0])]
+
+        if vhs_nodes:
+            vhs_nodes.sort(key=lambda item: item[0])
+            return [node_key for _, node_key in vhs_nodes]
 
         sampler_candidates.sort(key=lambda item: item[0])
         return [node_key for _, node_key in sampler_candidates]
@@ -771,36 +792,43 @@ class GenerationWorker:
             return
 
         milestones_done: Set[str] = state.setdefault("milestones_done", set())
+        before = len(milestones_done)
         milestones_done.add(node_key)
+        if len(milestones_done) > before:
+            state["last_milestone_source"] = "executed"
 
-    def _mark_progress_cycle_completion(self, request_id: str, value: Any, max_value: Any) -> None:
+    def _mark_progress_cycle_completion(self, request_id: str, value: Any, max_value: Any) -> bool:
         state = self._global_progress_state.get(request_id)
         if not state:
-            return
+            return False
 
         try:
             value_f = float(value)
             max_f = float(max_value)
         except (TypeError, ValueError):
-            return
+            return False
 
         if max_f <= 0:
-            return
+            return False
 
         # Reset latch as soon as a new cycle starts.
         if value_f < max_f:
             state["cycle_completion_latched"] = False
-            return
+            return False
 
         if state.get("cycle_completion_latched", False):
-            return
+            return False
 
         state["cycle_completion_latched"] = True
         synthetic_done = int(state.get("synthetic_milestones_done", 0)) + 1
         total = int(state.get("milestones_total", 0))
         if total > 0:
             synthetic_done = min(synthetic_done, total)
+        if synthetic_done <= int(state.get("synthetic_milestones_done", 0)):
+            return False
         state["synthetic_milestones_done"] = synthetic_done
+        state["last_milestone_source"] = "cycle"
+        return True
 
     def _build_global_progress_payload(
         self,
@@ -813,12 +841,21 @@ class GenerationWorker:
             return {"percent": 0}
 
         milestones_total = int(state.get("milestones_total", 0))
-        milestones_done_count = len(state.get("milestones_done", set()))
-        # Synthetic fallback is only valid when no explicit milestones were detected.
-        synthetic_done_count = 0
-        if milestones_total <= 0:
-            synthetic_done_count = int(state.get("synthetic_milestones_done", 0))
+        executed_done_count = len(state.get("milestones_done", set()))
+        synthetic_done_count = int(state.get("synthetic_milestones_done", 0))
+        milestones_done_count = executed_done_count
         milestones_done_count = max(milestones_done_count, synthetic_done_count)
+        if milestones_total > 0:
+            milestones_done_count = min(milestones_total, milestones_done_count)
+
+        milestone_source = "none"
+        if milestones_done_count > 0:
+            if synthetic_done_count > executed_done_count:
+                milestone_source = "cycle"
+            elif executed_done_count > synthetic_done_count:
+                milestone_source = "executed"
+            else:
+                milestone_source = str(state.get("last_milestone_source", "executed"))
 
         local_pct = 0.0
         if isinstance(value, (int, float)) and isinstance(max_value, (int, float)) and max_value > 0:
@@ -858,6 +895,9 @@ class GenerationWorker:
             "milestones": {
                 "done": milestones_done_count,
                 "total": milestones_total,
+                "executed_done": executed_done_count,
+                "cycle_done": synthetic_done_count,
+                "source": milestone_source,
             },
         }
         return payload
