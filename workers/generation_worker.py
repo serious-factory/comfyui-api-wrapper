@@ -518,7 +518,11 @@ class GenerationWorker:
                                     value = progress_data.get("value", 0)
                                     max_value = progress_data.get("max", 100)
                                     progress_pct = (value / max_value * 100) if max_value > 0 else 0
-                                    self._mark_progress_cycle_completion(request_id, value, max_value)
+                                    # Only use synthetic cycle completion when no explicit milestones exist.
+                                    state = self._global_progress_state.get(request_id, {})
+                                    milestones_total = int(state.get("milestones_total", 0))
+                                    if milestones_total <= 0:
+                                        self._mark_progress_cycle_completion(request_id, value, max_value)
                                     global_progress_payload = self._build_global_progress_payload(request_id, value=value, max_value=max_value)
                                     global_percent = global_progress_payload.get("percent", 0)
                                     progress_msg = self._format_global_stage_message(request_id, global_percent)
@@ -810,7 +814,10 @@ class GenerationWorker:
 
         milestones_total = int(state.get("milestones_total", 0))
         milestones_done_count = len(state.get("milestones_done", set()))
-        synthetic_done_count = int(state.get("synthetic_milestones_done", 0))
+        # Synthetic fallback is only valid when no explicit milestones were detected.
+        synthetic_done_count = 0
+        if milestones_total <= 0:
+            synthetic_done_count = int(state.get("synthetic_milestones_done", 0))
         milestones_done_count = max(milestones_done_count, synthetic_done_count)
 
         local_pct = 0.0
