@@ -476,6 +476,7 @@ class GenerationWorker:
                                     if node:
                                         logger.info(f"Executing node: {node}")
                                         execution_result["nodes_executed"].append(node)
+                                        self._mark_executing_node(request_id, node)
                                         progress_payload = self._build_global_progress_payload(request_id)
                                         stage_message = self._format_global_stage_message(request_id)
                                         await self._update_progress(request_id, stage_message)
@@ -518,9 +519,12 @@ class GenerationWorker:
                                     value = progress_data.get("value", 0)
                                     max_value = progress_data.get("max", 100)
                                     progress_pct = (value / max_value * 100) if max_value > 0 else 0
-                                    # Always track cycle completion from websocket progress.
-                                    # This keeps progress moving even when executed milestones
-                                    # are sparse/missing for the chosen milestone nodes.
+                                    progress_node = progress_data.get("node")
+                                    if progress_node is not None:
+                                        self._mark_executing_node(request_id, progress_node)
+                                    # Track cycle completion from websocket progress only after
+                                    # we actually entered pass milestone execution. This avoids
+                                    # early synthetic jumps (e.g. 23%) during pre-pass nodes.
                                     self._mark_progress_cycle_completion(request_id, value, max_value)
                                     global_progress_payload = self._build_global_progress_payload(request_id, value=value, max_value=max_value)
                                     global_percent = global_progress_payload.get("percent", 0)
@@ -713,6 +717,9 @@ class GenerationWorker:
             "milestone_nodes": milestone_nodes,
             "milestones_total": len(milestone_nodes),
             "milestones_done": set(),
+            # Becomes true once we enter a real pass milestone node.
+            "milestone_started": False,
+            "current_executing_node": None,
             # Cycle counter from websocket progress(value/max) completions.
             # Used as a resilient fallback when executed milestones do not fire.
             "synthetic_milestones_done": 0,
@@ -781,16 +788,30 @@ class GenerationWorker:
         sampler_candidates.sort(key=lambda item: item[0])
         return [node_key for _, node_key in sampler_candidates]
 
+    def _mark_executing_node(self, request_id: str, node: Any) -> None:
+        state = self._global_progress_state.get(request_id)
+        if not state or node is None:
+            return
+
+        node_key = str(node)
+        state["current_executing_node"] = node_key
+
+        milestone_nodes = state.get("milestone_nodes", [])
+        if node_key in milestone_nodes:
+            state["milestone_started"] = True
+
     def _mark_executed_milestone(self, request_id: str, node: Any) -> None:
         state = self._global_progress_state.get(request_id)
         if not state:
             return
 
         node_key = str(node)
+        state["current_executing_node"] = node_key
         milestone_nodes = state.get("milestone_nodes", [])
         if node_key not in milestone_nodes:
             return
 
+        state["milestone_started"] = True
         milestones_done: Set[str] = state.setdefault("milestones_done", set())
         before = len(milestones_done)
         milestones_done.add(node_key)
@@ -811,6 +832,13 @@ class GenerationWorker:
         if max_f <= 0:
             return False
 
+        total = int(state.get("milestones_total", 0))
+        if total > 0:
+            milestone_started = bool(state.get("milestone_started", False))
+            executed_done_count = len(state.get("milestones_done", set()))
+            if not milestone_started and executed_done_count == 0:
+                return False
+
         # Reset latch as soon as a new cycle starts.
         if value_f < max_f:
             state["cycle_completion_latched"] = False
@@ -821,7 +849,6 @@ class GenerationWorker:
 
         state["cycle_completion_latched"] = True
         synthetic_done = int(state.get("synthetic_milestones_done", 0)) + 1
-        total = int(state.get("milestones_total", 0))
         if total > 0:
             synthetic_done = min(synthetic_done, total)
         if synthetic_done <= int(state.get("synthetic_milestones_done", 0)):
@@ -848,6 +875,12 @@ class GenerationWorker:
         if milestones_total > 0:
             milestones_done_count = min(milestones_total, milestones_done_count)
 
+        milestone_started = (
+            bool(state.get("milestone_started", False))
+            or executed_done_count > 0
+            or synthetic_done_count > 0
+        )
+
         milestone_source = "none"
         if milestones_done_count > 0:
             if synthetic_done_count > executed_done_count:
@@ -862,15 +895,18 @@ class GenerationWorker:
             local_pct = max(0.0, min(100.0, (float(value) / float(max_value)) * 100.0))
 
         if milestones_total > 0:
-            # Pass-based global progress strategy:
-            # - 5% at start of first pass
-            # - 95% at end of last pass
-            # - each pass gets an equal slice of the 90% middle range
-            slice_size = 90.0 / float(milestones_total)
-            clamped_done = max(0, min(milestones_total, milestones_done_count))
-            local_ratio = local_pct / 100.0
-            estimated = 5.0 + ((float(clamped_done) + local_ratio) * slice_size)
-            estimated = min(95.0, estimated)
+            if not milestone_started and milestones_done_count == 0:
+                estimated = 5.0
+            else:
+                # Pass-based global progress strategy:
+                # - 5% at start of first pass
+                # - 95% at end of last pass
+                # - each pass gets an equal slice of the 90% middle range
+                slice_size = 90.0 / float(milestones_total)
+                clamped_done = max(0, min(milestones_total, milestones_done_count))
+                local_ratio = local_pct / 100.0
+                estimated = 5.0 + ((float(clamped_done) + local_ratio) * slice_size)
+                estimated = min(95.0, estimated)
         else:
             # No pass milestones available: fallback to local websocket progress.
             estimated = local_pct
@@ -897,6 +933,7 @@ class GenerationWorker:
                 "total": milestones_total,
                 "executed_done": executed_done_count,
                 "cycle_done": synthetic_done_count,
+                "started": milestone_started,
                 "source": milestone_source,
             },
         }
